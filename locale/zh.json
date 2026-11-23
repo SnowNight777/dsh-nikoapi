@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "NikoAPI",
+    "description": "连接 NikoAPI（New API 中转）账号：读取模型 Key、按分组接入模型，并在检测到兼容的 dsh-cost-meter 后自动注册已确认模型的价格计算器。管理令牌与模型 Key 保存在本机凭据库，界面不回显。",
+    "detail": "docs/DETAIL.md"
+  }
+}

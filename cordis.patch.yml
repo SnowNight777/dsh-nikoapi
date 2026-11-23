@@ -1,0 +1,6 @@
+- insert:
+    - id: nikoapi
+      name: dsh-nikoapi
+      config:
+        baseUrl: https://nikoapi.xyz
+        refreshMinutes: 15
