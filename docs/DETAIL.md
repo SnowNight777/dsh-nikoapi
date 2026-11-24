@@ -8,9 +8,13 @@ Connect NikoAPI (New API relay) model Keys to DeepSeek Harness. Settings entry: 
 - **Models:** preview each selected Key's available model catalog, explicitly select models, and confirm the exact provider routes. Same model IDs under different Keys remain separate routes and credentials.
 - **Automatic cost-meter calculator:** when the supported cost-meter 1.9.78 Host service is available, NikoAPI registers synchronous price calculators for already-confirmed models whose Key is enabled and whose exact provider route passed readback. No opt-in checkbox is required. Model refresh and confirmation refresh the cached calculator rates. The periodic refresh updates model/rate data, not the Key directory.
 
-## Compatibility limitation
+## Protocol routing
 
-All generated provider routes currently use `openai-completions`. Native protocol adaptation for OpenAI Responses, Anthropic Messages, and Google Generative AI is not implemented. Do not assume GPT, Claude, or Gemini models will use their native DSH protocol. This needs to be resolved and tested before a general release.
+NikoAPI model and pricing metadata may advertise endpoint types. The plugin maps recognized declarations to DSH protocols: `openai` to `openai-completions`, `openai-response` to `openai-responses`, `anthropic` to `anthropic-messages`, and `gemini` to `google-generative-ai`. Explicit GPT model IDs always use `openai-responses`, even if the site omits that endpoint declaration. This is the only model-ID protocol override; other model families are not inferred from their names.
+
+A NikoAPI group is the protocol-capability unit: confirmed LLM models in a fixed group share that group's declared protocol set. For an `auto` Key, only protocols common to all selected candidate groups are used. If endpoint metadata is absent, unknown, or yields no common protocol, the plugin preserves a matching prior protocol assignment or uses legacy `openai-completions`, except for the explicit GPT rule.
+
+The stable route ID remains `nikoapi-<Key ID>` for compatibility, and one Key is never split into multiple Providers. If a GPT model is confirmed on a Key, that Key's single Provider uses `openai-responses`, so the same protocol applies to every confirmed model on that Key. Mixed selections should therefore be limited to models supported by the chosen protocol. The selected route protocol is read back and verified together with the exact Key credential reference, base URL, capabilities, and exact model IDs. Only explicitly confirmed model IDs are included; cleanup removes old protocol-suffixed route IDs only when they are recorded as plugin-owned.
 
 ## Credentials and permissions
 
@@ -44,7 +48,7 @@ Prices are normalized from NikoAPI's `/api/pricing`; currency and quota units co
 
 ## Provider routes
 
-After explicit model confirmation, NikoAPI creates one `openai-completions` route per Key (`nikoapi-<Key ID>`, base URL `<site>/v1`, credential reference `NIKOAPI_API_KEY_<Key ID>`). It uses settings revision/CAS and reads back route, credential reference, protocol, endpoint, and exact model IDs. Cleanup only removes routes recorded as owned by this plugin; similar unowned provider IDs are not touched. Group changes preserve the user's model choices, refresh that Key's pricing identity, and update its existing routes without selecting additional models.
+After explicit model confirmation, NikoAPI creates exactly one provider route per Key (base URL `<site>/v1`, credential reference `NIKOAPI_API_KEY_<Key ID>`). For non-GPT models, group endpoint metadata is reduced to one common protocol using the priority `openai-responses`, `anthropic-messages`, `google-generative-ai`, then `openai-completions`; any confirmed GPT model overrides the Key route to `openai-responses`. The stable route ID is always `nikoapi-<Key ID>`. Settings revision/CAS reads back route, credential reference, selected protocol, endpoint, and exact model IDs. Cleanup removes old suffixed route IDs only when recorded as plugin-owned; similar unowned provider IDs are not touched. Group changes preserve the user's model choices, refresh that Key's pricing identity, and update its one route without selecting additional models.
 
 ## State and validation boundaries
 

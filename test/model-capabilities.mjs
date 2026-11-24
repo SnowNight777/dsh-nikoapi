@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { buildProviderRoute, modelCapabilities, planRoutes, registrationStatus, keyRef } from '../lib/models.js'
+import { buildProviderRoute, isGptModel, isLlmModel, modelCapabilities, planRoutes, registrationStatus, keyRef } from '../lib/models.js'
 import { mergeState } from '../lib/state.js'
 import { createNikoClient } from '../lib/niko.js'
 import { startMockNiko, PAT_FULL } from './mock-niko.mjs'
@@ -43,14 +43,22 @@ try {
     delete route.models[0].input
     assert.equal(registrationStatus({ providers: { 'nikoapi-11': route } }, entries, mock.origin).registered, false)
   })
-  await test('Niko reader preserves explicit capability declarations', async () => {
-    const payload = { data: [{ id: 'explicit', input_modalities: ['text'], reasoning_efforts: false }, { id: 'missing' }] }
+  await test('Niko reader admits only declared LLM models plus the explicit GPT rule', async () => {
+    const payload = { data: [
+      { id: 'explicit', supported_endpoint_types: ['openai'], input_modalities: ['text'], reasoning_efforts: false },
+      { id: 'gpt-6.2-astra' },
+      { id: 'image-only', supported_endpoint_types: ['image-generation'] },
+      { id: 'unknown-protocol', supported_endpoint_types: ['vendor-unknown'] },
+      { id: 'no-protocol' },
+    ] }
     const client = createNikoClient({ baseUrl: mock.origin, fetch: async () => new Response(JSON.stringify(payload), { status: 200 }) })
-    const [explicit, missing] = await client.listModels('synthetic-key')
-    assert.deepEqual(explicit.inputModalities, ['text'])
-    assert.equal(explicit.reasoningEfforts, false)
-    assert.equal(missing.inputModalities, null)
-    assert.equal(missing.reasoningEfforts, null)
+    const models = await client.listModels('synthetic-key')
+    assert.deepEqual(models.map(row => row.id), ['explicit', 'gpt-6.2-astra'])
+    assert.equal(models[0].inputModalities[0], 'text')
+    assert.equal(models[0].reasoningEfforts, false)
+    assert.equal(isLlmModel(models[1]), true)
+    assert.equal(isGptModel(models[1]), true)
+    assert.equal(isLlmModel({ id: 'gpt-image-1', supportedEndpoints: ['image-generation'] }), false)
   })
   await test('Host preview, confirm, persistence and reregistration use the same defaults', async () => {
     const host = await startMockHost(mock.origin)

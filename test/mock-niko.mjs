@@ -13,7 +13,17 @@ const initialKeys = [
 ]
 const initialKeySecrets = new Map([[11, MODEL_KEY], [12, SECOND_MODEL_KEY], [13, THIRD_MODEL_KEY]])
 const initialCatalogs = new Map([[MODEL_KEY, ['gpt-test', 'claude-test']], [SECOND_MODEL_KEY, ['gpt-test', 'gemini-test']], [THIRD_MODEL_KEY, ['llama-test']]])
-const initialModels = new Map([...initialCatalogs].map(([key, ids]) => [key, ids.map(id => ({ id, object: 'model' }))]))
+const initialModels = new Map([
+  [MODEL_KEY, [
+    { id: 'gpt-test', object: 'model', supported_endpoint_types: ['openai', 'openai-response'] },
+    { id: 'claude-test', object: 'model', supported_endpoint_types: ['anthropic'] },
+  ]],
+  [SECOND_MODEL_KEY, [
+    { id: 'gpt-test', object: 'model', supported_endpoint_types: ['openai'] },
+    { id: 'gemini-test', object: 'model', supported_endpoint_types: ['gemini'] },
+  ]],
+  [THIRD_MODEL_KEY, [{ id: 'llama-test', object: 'model' }]],
+])
 function send(res, status, value, headers = {}) {
   const body = JSON.stringify(value)
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body), ...headers })
@@ -28,7 +38,7 @@ export async function startMockNiko(options = {}) {
   const modelCatalogs = new Map([...initialCatalogs].map(([key, ids]) => [key, [...ids]]))
   const models = new Map([...initialModels].map(([key, rows]) => [key, structuredClone(rows)]))
   if (options.expressionModel) {
-    models.set(MODEL_KEY, [...models.get(MODEL_KEY).filter(row => row.id !== 'tiered-test'), { id: 'tiered-test', object: 'model' }])
+    models.set(MODEL_KEY, [...models.get(MODEL_KEY).filter(row => row.id !== 'tiered-test'), { id: 'tiered-test', object: 'model', supported_endpoint_types: ['openai'] }])
     modelCatalogs.set(MODEL_KEY, [...new Set([...modelCatalogs.get(MODEL_KEY), 'tiered-test'])])
   }
   const requests = new Map()
@@ -82,10 +92,10 @@ export async function startMockNiko(options = {}) {
       return send(res, 200, { code: true, data: { total_granted: 500000, total_used: 20000, total_available: 480000, unlimited_quota: false, model_limits_enabled: true, model_limits: modelCatalogs.get(token), expires_at: 0, user_quota: { total_available: 9000000, total_used: 1000000 } } })
     }
     if (url.pathname === '/api/pricing') return send(res, 200, { success: true, data: [
-      { model_name: 'gpt-test', quota_type: 0, model_ratio: 1, completion_ratio: 2, cache_ratio: 0.1, create_cache_ratio: 0.15, enable_groups: ['default', 'vip'] },
-      { model_name: 'o4-mini', quota_type: 0, model_ratio: 0.55, completion_ratio: 1, enable_groups: ['GPT官key'] },
-      { model_name: 'claude-test', quota_type: 0, model_ratio: 2, completion_ratio: 3, cache_ratio: 0.2, create_cache_ratio: 0.3, enable_groups: ['default'] },
-      { model_name: 'gemini-test', quota_type: 0, model_ratio: 1, completion_ratio: 1.5, cache_ratio: 0.2, create_cache_ratio: 0.2, enable_groups: ['vip'] },
+      { model_name: 'gpt-test', quota_type: 0, model_ratio: 1, completion_ratio: 2, cache_ratio: 0.1, create_cache_ratio: 0.15, enable_groups: ['default', 'vip'], supported_endpoint_types: ['openai', 'openai-response'] },
+      { model_name: 'o4-mini', quota_type: 0, model_ratio: 0.55, completion_ratio: 1, enable_groups: ['GPT官key'], supported_endpoint_types: ['openai-response'] },
+      { model_name: 'claude-test', quota_type: 0, model_ratio: 2, completion_ratio: 3, cache_ratio: 0.2, create_cache_ratio: 0.3, enable_groups: ['default'], supported_endpoint_types: ['anthropic'] },
+      { model_name: 'gemini-test', quota_type: 0, model_ratio: 1, completion_ratio: 1.5, cache_ratio: 0.2, create_cache_ratio: 0.2, enable_groups: ['vip'], supported_endpoint_types: ['openai-response', 'gemini'] },
       { model_name: 'llama-test', quota_type: 0, model_ratio: 1, completion_ratio: 1, cache_ratio: 0.1, create_cache_ratio: 0.1, enable_groups: ['vip'] },
       { model_name: 'per-call-test', quota_type: 1, model_price: 0.02, enable_groups: ['default'] },
       { model_name: 'tiered-test', quota_type: 0, model_ratio: 1, billing_mode: 'tiered_expr', billing_expr: expression, enable_groups: ['default'] },

@@ -10,7 +10,7 @@ import { normalizeGroups, groupSecondary } from '../lib/groups.js'
 import { planBinding, planUnbind, BALANCE_LABEL } from '../lib/costmeter.js'
 import { planPriceBinding, planPriceUnbind } from '../lib/costmeter-prices.js'
 import { readState, writeState, mergeState, emptyState } from '../lib/state.js'
-import { buildProviderRoute, findProvidersNamespace, modelCapabilities, planRoutes, registrationStatus, keyRef, keyRoute } from '../lib/models.js'
+import { buildProviderRoute, findProvidersNamespace, groupProtocolMap, isGptModel, modelCapabilities, modelProtocols, planRoutes, registrationStatus, routeEntries, keyRef, keyRoute } from '../lib/models.js'
 import { isTrustedRequest } from '../index.js'
 import { startMockHost } from './mock-host.mjs'
 
@@ -59,7 +59,7 @@ try {
     assert.equal(await client.revealKey(PAT_FULL, 13), THIRD_MODEL_KEY)
     assert.deepEqual((await client.listModels(MODEL_KEY)).map(row => row.id), ['gpt-test', 'claude-test'])
     assert.deepEqual((await client.listModels(SECOND_MODEL_KEY)).map(row => row.id), ['gpt-test', 'gemini-test'])
-    assert.deepEqual((await client.listModels(THIRD_MODEL_KEY)).map(row => row.id), ['llama-test'])
+    assert.deepEqual((await client.listModels(THIRD_MODEL_KEY)).map(row => row.id), [])
   })
   await test('account prices require dashboard identity instead of accepting an anonymous model-key response', async () => {
     await assert.rejects(client.pricing(MODEL_KEY, { requireIdentity: true }), error => error.code === 'UNAUTHORIZED')
@@ -77,6 +77,8 @@ try {
     const updated = await client.updateGroup(PAT_FULL, 11, { group: 'vip' })
     assert.equal(updated.group, 'vip')
     assert.equal(mock.groupUpdates.at(-1).id, 11)
+    const restored = await client.updateGroup(PAT_FULL, 11, { group: 'default' })
+    assert.equal(restored.group, 'default')
   })
   await test('fixed, automatic and unknown group prices are not fabricated', async () => {
     const table = await client.pricing(PAT_FULL)
@@ -96,13 +98,64 @@ try {
     assert.equal(svip.input, 0.165); assert.equal(svip.output, 0.165); assert.equal(svip.cacheHit, 0.165); assert.equal(svip.cacheWrite, 0.165)
     assert.equal(normalizePricing([{ model_name: 'missing' }], { groupRatio: { default: 1 }, quotaPerUnit: 1, currency: 'CNY', candidateGroups: ['default'] }).get('missing').kind, 'unknown')
   })
-  await test('provider routes preserve distinct credentials even for duplicate model ids', async () => {
+  await test('one provider preserves one credential per Key and selects one shared protocol', async () => {
     const routeA = buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(11), modelIds: ['gpt-test'], label: 'dev' })
     const routeB = buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(12), modelIds: ['gpt-test'], label: 'general' })
+    const response = buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(11), modelIds: ['gpt-test'], label: 'dev', protocol: 'openai-responses' })
     assert.equal(routeA.apiKeyEnv, 'NIKOAPI_API_KEY_11')
     assert.notEqual(routeA.apiKeyEnv, routeB.apiKeyEnv)
     assert.notEqual(routeA.displayName, routeB.displayName)
     assert.equal(routeA.baseURL, `${mock.origin}/v1`)
+    assert.equal(response.api, 'openai-responses')
+    assert.equal(keyRoute(11), 'nikoapi-11')
+  })
+  await test('group protocol sets are shared across models and auto groups use their intersection', () => {
+    const rows = [
+      { model_name: 'gpt-x', enable_groups: ['mixed'], supported_endpoint_types: ['openai', 'openai-response'] },
+      { model_name: 'claude-x', enable_groups: ['mixed'], supported_endpoint_types: ['anthropic', 'openai-response'] },
+      { model_name: 'image', enable_groups: ['mixed'], supported_endpoint_types: ['image-generation'] },
+      { model_name: 'ignored', enable_groups: ['unknown'], supported_endpoint_types: ['not-a-dsh-protocol'] },
+      { model_name: 'a', enable_groups: ['a', 'mixed'], supported_endpoint_types: ['openai', 'openai-response'] },
+      { model_name: 'b', enable_groups: ['b'], supported_endpoint_types: ['openai', 'anthropic'] },
+    ]
+    const groups = groupProtocolMap(rows, ['mixed', 'a', 'b', 'unknown'])
+    assert.deepEqual(groups.get('mixed'), ['openai-completions', 'openai-responses', 'anthropic-messages'])
+    const separateGroups = groupProtocolMap([
+      { enable_groups: ['default', 'vip'], supported_endpoint_types: ['openai', 'openai-response'] },
+      { enable_groups: ['default'], supported_endpoint_types: ['anthropic'] },
+      { enable_groups: ['vip'], supported_endpoint_types: ['gemini'] },
+    ], ['default', 'vip'])
+    assert.deepEqual(separateGroups.get('default'), ['openai-completions', 'openai-responses', 'anthropic-messages'])
+    assert.deepEqual(separateGroups.get('vip'), ['openai-completions', 'openai-responses', 'google-generative-ai'])
+    assert.equal(groups.has('unknown'), false, 'unknown endpoint strings do not establish group support')
+    const key = { group: 'mixed' }
+    assert.deepEqual(modelProtocols({ supportedEndpoints: ['anthropic'] }, key, groups), groups.get('mixed'), 'same-group models share the group capability set')
+    assert.deepEqual(modelProtocols({ supportedEndpoints: ['image-generation'] }, key, groups), ['openai-completions'], 'image-only models stay on the legacy route')
+    assert.deepEqual(modelProtocols({ supportedEndpoints: ['openai'] }, { group: 'auto', autoGroups: ['a', 'b'] }, groups), ['openai-completions'], 'auto group protocols are intersected')
+    const routes = routeEntries([{ keyId: 11, modelIds: ['gpt-x', 'claude-x'], models: [
+      { id: 'gpt-x', protocols: groups.get('mixed') }, { id: 'claude-x', protocols: groups.get('mixed') },
+    ] }])
+    assert.deepEqual(routes.map(route => [route.providerId, route.protocol, ...route.modelIds]), [
+      ['nikoapi-11', 'openai-responses', 'gpt-x', 'claude-x'],
+    ])
+    const gptOverride = routeEntries([{ keyId: 13, modelIds: ['gpt-6.2-astra'], models: [
+      { id: 'gpt-6.2-astra', protocols: ['openai-completions'] },
+    ] }])
+    assert.equal(gptOverride[0].protocol, 'openai-responses', 'GPT uses Responses even when the site advertises only Chat')
+    assert.equal(isGptModel({ id: 'openai/gpt-6.2-astra' }), true, 'provider-prefixed GPT IDs use the explicit GPT rule')
+    assert.equal(isGptModel({ id: 'gpt-image-1', supportedEndpoints: ['image-generation'] }), false, 'image generation is not forced onto Responses')
+    const nonGptRoute = routeEntries([{ keyId: 14, modelIds: ['claude-x'], models: [
+      { id: 'claude-x', protocols: ['openai-completions'] },
+    ] }])
+    assert.equal(nonGptRoute[0].protocol, 'openai-completions', 'non-GPT models continue to follow advertised protocols')
+    const singleProtocol = routeEntries([{ keyId: 12, modelIds: ['gpt-x', 'claude-x'], models: [
+      { id: 'gpt-x', protocols: ['openai-responses'] }, { id: 'claude-x', protocols: ['anthropic-messages'] },
+    ] }])
+    assert.equal(singleProtocol[0].protocol, 'openai-responses', 'a confirmed GPT selects Responses on its Key’s single Provider')
+    const plan = planRoutes([], [{ keyId: 11, modelIds: ['gpt-x', 'claude-x'], models: [
+      { id: 'gpt-x', protocols: groups.get('mixed') }, { id: 'claude-x', protocols: groups.get('mixed') },
+    ] }], mock.origin)
+    assert.deepEqual(Object.keys(plan.routes), ['nikoapi-11'])
   })
   await test('route plans remove only previously owned ids, never prefix lookalikes', async () => {
     const plan = planRoutes(['nikoapi-11', 'nikoapi-12'], [{ keyId: 11, name: 'dev', modelIds: ['gpt-test'] }], mock.origin)
@@ -119,7 +172,7 @@ try {
   })
   await test('route readback checks key, protocol, endpoint and exact model set', async () => {
     const entries = [{ keyId: 11, modelIds: ['gpt-test'] }]
-    const section = { providers: { [keyRoute(11)]: buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(11), modelIds: ['gpt-test'] }) } }
+    const section = { providers: { [keyRoute(11)]: buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(11), modelIds: ['gpt-test'], protocol: 'openai-responses' }) } }
     assert.equal(registrationStatus(section, entries, mock.origin).registered, true)
     assert.equal(registrationStatus({ providers: { ...section.providers, 'nikoapi-11': { ...section.providers['nikoapi-11'], apiKeyEnv: keyRef(12) } } }, entries, mock.origin).registered, false)
     assert.equal(registrationStatus({ providers: {} }, entries, mock.origin).missing[0], keyRoute(11))
@@ -180,6 +233,16 @@ try {
     assert.deepEqual(migrated.confirmed.map(row => [row.keyId, row.modelId]), [[11, 'gpt-test']])
     assert.deepEqual(migrated.registration.routes, ['nikoapi'])
     assert.deepEqual(mergeState({ version: 2, selectedKeys: [{ id: 11 }, { id: 12 }], legacyKeyId: 11 }).selectedKeys.map(row => row.id), [11, 12])
+    const v3 = mergeState({ version: 3, selectedKeys: [{ id: 11 }], confirmed: [{ keyId: 11, modelId: 'gpt-test', protocols: ['anthropic-messages'], supportedEndpoints: ['anthropic'] }], registration: { routes: ['nikoapi-11'] } })
+    assert.deepEqual(v3.confirmed[0].protocols, ['openai-completions'], 'legacy state keeps its established completions route')
+    assert.deepEqual(v3.registration.routes, ['nikoapi-11'])
+    const v4 = mergeState({ version: 4, selectedKeys: [{ id: 11 }], confirmed: [{ keyId: 11, modelId: 'claude', protocols: ['anthropic-messages'], supportedEndpoints: ['anthropic'], protocolIdentity: '["default",[],false]' }], protocolGroups: { default: ['anthropic-messages'], ignored: ['bogus'] }, registration: { routes: ['nikoapi-11', 'nikoapi-11-anthropic'] } })
+    assert.deepEqual(v4.confirmed[0].protocols, ['anthropic-messages'])
+    assert.deepEqual(v4.protocolGroups, { default: ['anthropic-messages'] })
+    assert.deepEqual(v4.registration.routes, ['nikoapi-11', 'nikoapi-11-anthropic'], 'saved split route IDs remain owned so migration can clean them')
+    const migratedRoutes = planRoutes(v4.registration.routes, [{ keyId: 11, modelIds: ['claude'], models: [{ id: 'claude', protocols: ['anthropic-messages'] }] }], mock.origin)
+    assert.deepEqual(Object.keys(migratedRoutes.routes), ['nikoapi-11'])
+    assert.deepEqual(migratedRoutes.removed, ['nikoapi-11-anthropic'])
   })
   await test('state roundtrip serializes concurrent writes without losing latest state', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'nikoapi-state-'))
@@ -188,7 +251,7 @@ try {
       await Promise.all(Array.from({ length: 20 }, (_, index) => writeState({ ...emptyState(), lastSyncedAt: String(index) }, file)))
       const stored = JSON.parse(await readFile(file, 'utf8'))
       assert.equal(stored.lastSyncedAt, '19')
-      assert.equal((await readState(file)).version, 3)
+      assert.equal((await readState(file)).version, 4)
       await writeState({ selectedKeys: [{ id: 11, name: 'dev', group: 'auto', autoGroups: ['default'], crossGroupRetry: true }] }, file)
       const restored = await readState(file)
       assert.deepEqual(restored.selectedKeys[0].autoGroups, ['default'])
@@ -214,23 +277,75 @@ try {
       const preview = await host.call('previewModels', { force: true })
       assert.equal(preview.body.data.keys.find(key => key.id === 12).models.some(model => model.modelId === 'gemini-test'), true)
       const confirmed = await host.call('confirmModels', { selections: [
-        { keyId: 11, modelIds: ['gpt-test'] }, { keyId: 12, modelIds: ['gpt-test', 'gemini-test'] }, { keyId: 13, modelIds: ['llama-test'] },
+        { keyId: 11, modelIds: ['gpt-test', 'claude-test'] }, { keyId: 12, modelIds: ['gpt-test', 'gemini-test'] }, { keyId: 13, modelIds: [] },
       ] })
       assert.equal(confirmed.body.ok, true)
       assert.equal(confirmed.body.data.registration.registered, true, JSON.stringify(confirmed.body.data.registration))
-      assert.deepEqual(host.providers['nikoapi-11'].models, [{ id: 'gpt-test', ...modelCapabilities() }])
-      assert.deepEqual(host.providers['nikoapi-12'].models, [{ id: 'gpt-test', ...modelCapabilities() }, { id: 'gemini-test', ...modelCapabilities() }])
+      const confirmedForKey11 = [{ id: 'gpt-test', ...modelCapabilities() }, { id: 'claude-test', ...modelCapabilities() }]
+      assert.deepEqual(host.providers['nikoapi-11'].models, confirmedForKey11)
+      assert.equal(host.providers['nikoapi-11'].api, 'openai-responses', 'one Key selects one common protocol')
+      assert.equal(host.providers['nikoapi-11-responses'], undefined)
+      assert.equal(host.providers['nikoapi-11-anthropic'], undefined)
+      assert(host.calculators.has('nikoapi-11:gpt-test'), 'gpt calculator follows the single Key route')
+      assert(host.calculators.has('nikoapi-11:claude-test'), 'Claude calculator follows the single Key route')
+      assert.equal(host.quote('nikoapi-11', 'gpt-test', { input: 1000, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0 })?.currency, 'CNY')
+      assert.equal(host.quote('nikoapi-11', 'claude-test', { input: 1000, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0 })?.currency, 'CNY')
+      const automatic = [{ id: 'gpt-test', ...modelCapabilities() }, { id: 'gemini-test', ...modelCapabilities() }]
+      assert.deepEqual(host.providers['nikoapi-12'].models, automatic)
+      assert.equal(host.providers['nikoapi-12'].api, 'openai-responses')
+      assert.equal(host.providers['nikoapi-12-responses'], undefined)
+      assert.equal(host.providers['nikoapi-12-gemini'], undefined, 'automatic groups still produce one common route')
       assert.equal(host.providers['nikoapi-11'].apiKeyEnv, 'NIKOAPI_API_KEY_11')
       assert.equal(host.providers['nikoapi-12'].apiKeyEnv, 'NIKOAPI_API_KEY_12')
       await host.call('setGroup', { keyId: 12, group: 'vip' })
-      assert.deepEqual(host.providers['nikoapi-12'].models.map(row => row.id), ['gpt-test', 'gemini-test'], 'group changes preserve the explicit model choices and refresh rates')
+      assert.deepEqual(host.providers['nikoapi-12'].models.map(row => row.id), ['gpt-test', 'gemini-test'], 'group changes preserve explicit choices')
+      assert.equal(host.providers['nikoapi-12'].api, 'openai-responses', 'the group still has one selected protocol')
+      assert.equal(host.providers['nikoapi-12-gemini'], undefined)
+      assert(host.calculators.has('nikoapi-12:gemini-test'), 'Gemini calculator follows the single Key route')
+      assert.equal(host.quote('nikoapi-12', 'gemini-test', { input: 1000, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0 })?.currency, 'CNY')
       assert.equal(host.providers.openai.displayName, 'OpenAI', 'foreign providers stay intact')
       const cleared = await host.call('selectKeys', { keys: [] })
       assert.equal(cleared.body.ok, true)
       assert.equal(host.providers['nikoapi-11'], undefined)
       assert.equal(host.providers['nikoapi-13'], undefined)
-      assert.equal(host.providers.openai.displayName, 'OpenAI')
+      assert.equal(host.providers['nikoapi-11-responses'], undefined)
+      assert.equal(host.providers['nikoapi-11-anthropic'], undefined)
+      assert.equal(host.providers['nikoapi-12-responses'], undefined)
+      assert.equal(host.providers['nikoapi-12-gemini'], undefined)
+      assert.equal(host.providers.openai.displayName, 'OpenAI', 'foreign providers stay intact')
       assert.equal(await host.secrets.has('NIKOAPI_API_KEY_11'), false)
+      assert.equal([...host.calculators.keys()].some(route => route.startsWith('nikoapi-11:')), false)
+      assert.equal([...host.calculators.keys()].some(route => route.startsWith('nikoapi-12:')), false)
+    } finally { await host.close() }
+  })
+
+  await test('activation consolidates only recorded protocol-suffix routes per Key', async () => {
+    const selectedKey = { id: 11, name: 'dev', group: 'default', autoGroups: null, crossGroupRetry: false, status: 'enabled' }
+    const previousRoutes = ['nikoapi-11', 'nikoapi-11-responses', 'nikoapi-11-anthropic', 'nikoapi-11-gemini']
+    const oldRoute = (id, api) => ({ displayName: id, apiKeyEnv: keyRef(11), api, baseURL: `${mock.origin}/v1`, models: [{ id: 'gpt-test', ...modelCapabilities() }] })
+    const providers = {
+      openai: { displayName: 'OpenAI', apiKeyEnv: 'OPENAI_API_KEY', api: 'openai-completions', baseURL: 'https://api.openai.com/v1', models: [{ id: 'gpt-x' }] },
+      'nikoapi-11': oldRoute('nikoapi-11', 'openai-completions'),
+      'nikoapi-11-responses': oldRoute('nikoapi-11-responses', 'openai-responses'),
+      'nikoapi-11-anthropic': oldRoute('nikoapi-11-anthropic', 'anthropic-messages'),
+      'nikoapi-11-gemini': oldRoute('nikoapi-11-gemini', 'google-generative-ai'),
+      'nikoapi-99-anthropic': oldRoute('nikoapi-99-anthropic', 'anthropic-messages'),
+    }
+    const host = await startMockHost(mock.origin, {
+      ...emptyState(),
+      selectedKeys: [selectedKey],
+      confirmed: [{ keyId: 11, modelId: 'gpt-test', name: 'gpt-test', supportedEndpoints: ['openai', 'openai-response', 'anthropic'],
+        protocols: ['openai-completions', 'openai-responses', 'anthropic-messages'], protocolIdentity: '["default",[],false]' }],
+      registration: { routes: previousRoutes, ns: 'llm-pi-ai', lastStatus: 'registered' },
+    }, { providers, secrets: [[keyRef(11), MODEL_KEY]] })
+    try {
+      const result = await host.call('registerModels')
+      assert.equal(result.body.ok, true, JSON.stringify(result.body))
+      assert.deepEqual(Object.keys(host.providers).filter(id => id.startsWith('nikoapi-')).sort(), ['nikoapi-11', 'nikoapi-99-anthropic'])
+      assert.equal(host.providers['nikoapi-11'].api, 'openai-responses', 'one Key takes the preferred supported group protocol')
+      assert.equal(host.providers['nikoapi-99-anthropic'].api, 'anthropic-messages', 'a prefix lookalike not in ownership state is preserved')
+      const stored = await host.readState()
+      assert.deepEqual(stored.registration.routes, ['nikoapi-11'], 'only the one current route remains owned')
     } finally { await host.close() }
   })
 

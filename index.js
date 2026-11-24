@@ -3,7 +3,7 @@ import { createNikoClient, NikoPermissionError } from './lib/niko.js'
 import { normalizePricing, hasExpressionBilling } from './lib/pricing.js'
 import { normalizeGroups } from './lib/groups.js'
 import { calculatePrice, hasManualPrice, usablePrice } from './lib/price-calculator.js'
-import { API_KEY_ENV, findProvidersNamespace, keyRef, keyRoute, modelCapabilities, planRoutes, registrationStatus } from './lib/models.js'
+import { API_KEY_ENV, findProvidersNamespace, isLlmModel, keyRef, keyRoute, groupProtocolMap, modelCapabilities, modelProtocols, normalizeProtocols, planRoutes, registrationStatus, routeEntries } from './lib/models.js'
 import { readState, writeState, emptyState, keyMetadata, directoryKeyMetadata, keyPriceIdentity } from './lib/state.js'
 import { HttpError } from './lib/http.js'
 
@@ -72,20 +72,37 @@ export function apply(ctx, config = {}) {
   }
   function section(ns) { return settings()?.describe?.({ redactSecrets: true })?.find(row => row.ns === ns) }
   function providerNamespace() { return findProvidersNamespace(ctx.get('llm')?.listConfigurableProviders?.()) }
-  function entriesFor(keys = state.selectedKeys, confirmed = state.confirmed) {
+  function protocolIdentityFor(key) {
+    return JSON.stringify([key?.group ?? '', key?.group === 'auto' ? [...(key.autoGroups ?? [])].sort() : [], key?.crossGroupRetry === true])
+  }
+  function protocolEntries(keys = state.selectedKeys, confirmed = state.confirmed) {
     return keys.filter(key => key.status === 'enabled').map(key => {
       const rows = confirmed.filter(row => row.keyId === key.id)
       return { keyId: key.id, name: `${key.name} · ${key.group || 'inherited'} · #${key.id}`,
-        modelIds: rows.map(row => row.modelId), models: rows.map(row => ({ id: row.modelId, ...modelCapabilities(row) })) }
+        modelIds: rows.map(row => row.modelId), models: rows.map(row => ({ id: row.modelId, supportedEndpoints: row.supportedEndpoints,
+          protocols: row.protocolIdentity === protocolIdentityFor(key) ? row.protocols : ['openai-completions'], ...modelCapabilities(row) })) }
     }).filter(row => row.modelIds.length)
+  }
+  function entriesFor(keys = state.selectedKeys, confirmed = state.confirmed) {
+    return protocolEntries(keys, confirmed)
   }
   function describeRegistration() {
     const ns = providerNamespace()
-    const entries = entriesFor()
+    const entries = protocolEntries()
     const status = ns ? registrationStatus(section(ns)?.value, entries, origin) : { registered: false, routes: [], missing: [] }
-    return { supported: ns !== null, ...status,
-      count: entries.filter(entry => status.routes.includes(keyRoute(entry.keyId))).reduce((n, entry) => n + entry.modelIds.length, 0),
-      models: state.confirmed.map(row => ({ route: keyRoute(row.keyId), id: row.modelId })), ns: ns || '',
+    const routes = routeEntries(entries)
+    const routeByModel = new Map()
+    for (const route of routes) for (const modelId of route.modelIds) {
+      const key = pair(route.keyId, modelId)
+      routeByModel.set(key, [...(routeByModel.get(key) ?? []), route.providerId])
+    }
+    const registered = new Set(status.routes)
+    const models = state.confirmed.map(row => {
+      const modelRoutes = (routeByModel.get(pair(row.keyId, row.modelId)) ?? []).filter(id => registered.has(id))
+      return { route: modelRoutes[0] ?? keyRoute(row.keyId), routes: modelRoutes, id: row.modelId }
+    })
+    const count = models.filter(row => row.routes.length > 0).length
+    return { supported: ns !== null, ...status, count, routeCount: status.routes.length, models, ns: ns || '',
       lastStatus: state.registration.lastStatus, lastMessage: state.registration.lastMessage }
   }
   /** CAS and readback protect unrelated routes and concurrent settings edits. */
@@ -165,7 +182,7 @@ export function apply(ctx, config = {}) {
   }
   function prunePrices() {
     state.priceSnapshots = state.priceSnapshots.filter(validSnapshot)
-    const wanted = new Set(state.priceSnapshots.map(row => pair(row.keyId, row.modelId)))
+    const wanted = new Set(routeEntries(entriesFor()).flatMap(entry => entry.models.map(model => pair(entry.keyId, model.id))))
     for (const id of slots.keys()) if (!wanted.has(id)) removeSlot(id)
   }
   function cachePrices(snapshot) {
@@ -193,6 +210,21 @@ export function apply(ctx, config = {}) {
   /** Registration only. This never changes cost-meter prices, balances, or recorded bills. */
   async function syncCosts({ stale = false } = {}) {
     prunePrices()
+    // Reconcile the one-provider-per-Key route even when the cost-meter service is absent.
+    // This also removes legacy protocol-suffix routes recorded as plugin-owned.
+    const entries = entriesFor()
+    let registration = describeRegistration()
+    const wantedRouteIds = routeEntries(entries).map(entry => entry.providerId).sort()
+    const recordedRouteIds = [...new Set(state.registration.routes)].sort()
+    const ownershipNeedsReconcile = JSON.stringify(wantedRouteIds) !== JSON.stringify(recordedRouteIds)
+    const needsRouteWrite = registration.supported && (ownershipNeedsReconcile
+      || (entries.length > 0 && (!registration.registered || registration.missing.length > 0)))
+    if (needsRouteWrite) {
+      try {
+        await writeRoutes(entries)
+        registration = describeRegistration()
+      } catch { registration = describeRegistration() }
+    }
     const service = meter
     const epoch = meterEpoch
     if (!service || !costFacts().available) {
@@ -221,32 +253,34 @@ export function apply(ctx, config = {}) {
       return costDescription()
     }
     meterConfig = current.config
-    const routes = new Set(describeRegistration().routes)
+    const routes = new Set(registration.routes)
     const cached = new Map(state.priceSnapshots.map(row => [pair(row.keyId, row.modelId), row]))
     const desired = new Set(), conflicts = [], unavailable = []
-    for (const row of state.confirmed) {
-      const id = pair(row.keyId, row.modelId), provider = keyRoute(row.keyId), label = `${provider}:${row.modelId}`
-      const rate = cached.get(id)
-      if (!routes.has(provider) || !rate || !usablePrice(rate.price, Date.now())) { unavailable.push(label); continue }
-      if (hasManualPrice(meterConfig, provider, row.modelId, state.costBinding)) { conflicts.push(label); continue }
-      desired.add(id)
-      const existing = slots.get(id)
-      if (existing) { existing.rate = rate; continue }
-      const slot = { active: true, rate, dispose: () => {} }
-      try {
-        const dispose = service.registerPriceCalculator({ provider, model: row.modelId, calculate({ usage, atMs }) {
-          if (!slot.active || disposed || meter !== service || meterEpoch !== epoch || !validSnapshot(slot.rate)
-            || !describeRegistration().routes.includes(provider)
-            || hasManualPrice(meterConfig, provider, row.modelId, state.costBinding)) return null
-          return calculatePrice(slot.rate.price, usage, atMs)
-        } })
-        if (typeof dispose !== 'function') throw new Error('calculator registration did not return a disposer')
-        slot.dispose = dispose
-        slots.set(id, slot)
-      } catch {
-        slot.active = false
-        desired.delete(id)
-        conflicts.push(label)
+    for (const entry of routeEntries(entries)) {
+      for (const model of entry.models) {
+        const id = pair(entry.keyId, model.id), rate = cached.get(id)
+        const label = `${entry.providerId}:${model.id}`
+        if (!routes.has(entry.providerId) || !rate || !usablePrice(rate.price, Date.now())) { unavailable.push(label); continue }
+        if (hasManualPrice(meterConfig, entry.providerId, model.id, state.costBinding)) { conflicts.push(label); continue }
+        desired.add(id)
+        const existing = slots.get(id)
+        if (existing) { existing.rate = rate; continue }
+        const slot = { active: true, rate, dispose: () => {} }
+        try {
+          const dispose = service.registerPriceCalculator({ provider: entry.providerId, model: model.id, calculate({ usage, atMs }) {
+            if (!slot.active || disposed || meter !== service || meterEpoch !== epoch || !validSnapshot(slot.rate)
+              || !describeRegistration().routes.includes(entry.providerId)
+              || hasManualPrice(meterConfig, entry.providerId, model.id, state.costBinding)) return null
+            return calculatePrice(slot.rate.price, usage, atMs)
+          } })
+          if (typeof dispose !== 'function') throw new Error('calculator registration did not return a disposer')
+          slot.dispose = dispose
+          slots.set(id, slot)
+        } catch {
+          slot.active = false
+          desired.delete(id)
+          conflicts.push(label)
+        }
       }
     }
     for (const id of [...slots.keys()]) if (!desired.has(id)) removeSlot(id)
@@ -396,14 +430,66 @@ export function apply(ctx, config = {}) {
         const prices = table === null ? new Map() : normalizePricing(table.rows, { groupRatio: table.groupRatio,
           quotaPerUnit: state.site?.quotaPerUnit ?? 500_000, usdExchangeRate: state.site?.usdExchangeRate ?? 1, currency,
           candidateGroups: candidates, reference: key.group === 'auto', unknownGroup: !key.group || (key.group === 'auto' && !candidates.length) })
-        entry.models = [...new Map(models.map(model => [model.id, model])).values()].map(model => ({ modelId: model.id, name: model.name,
-          ...modelCapabilities({ input: model.inputModalities, reasoningEfforts: model.reasoningEfforts }),
-          price: prices.get(model.id) ?? { kind: 'unknown', currency, note: table === null ? 'price table unavailable for this Key' : 'no exact applicable price' },
-          confirmed: state.confirmed.some(row => row.keyId === key.id && row.modelId === model.id) }))
+        entry.models = [...new Map(models.map(model => [model.id, model])).values()].map(model => {
+          const prior = state.confirmed.find(row => row.keyId === key.id && row.modelId === model.id)
+          const pricingRows = table?.rows?.filter(row => row?.model_name === model.id) ?? []
+          const pricingEndpoints = [...new Set(pricingRows.flatMap(row => Array.isArray(row?.supported_endpoint_types) ? row.supported_endpoint_types : []))]
+          const supportedEndpoints = model.supportedEndpoints ?? (pricingEndpoints.length ? pricingEndpoints : null)
+          return { modelId: model.id, name: model.name, supportedEndpoints,
+            ...modelCapabilities({ input: model.inputModalities, reasoningEfforts: model.reasoningEfforts }),
+            price: prices.get(model.id) ?? { kind: 'unknown', currency, note: table === null ? 'price table unavailable for this Key' : 'no exact applicable price' },
+            confirmed: Boolean(prior) }
+        }).filter(isLlmModel)
       } catch (error) { entry.error = safeFailure(error).message }
       keys.push(entry)
     }
     if (disposed) throw fail('disposed', 'plugin is no longer active')
+
+    const knownGroups = [...new Set([
+      ...Object.keys(table?.groupRatio ?? {}),
+      ...keys.flatMap(entry => [entry.group, ...(state.selectedKeys.find(key => key.id === entry.id)?.autoGroups ?? [])]),
+    ].filter(group => typeof group === 'string' && group && group !== 'auto'))]
+    const modelProtocolRows = keys.flatMap(entry => {
+      const key = state.selectedKeys.find(row => row.id === entry.id)
+      if (!key || key.group === 'auto') return []
+      return entry.models.map(model => ({ group: key.group, supportedEndpoints: model.supportedEndpoints }))
+    })
+    const protocolGroups = groupProtocolMap([...(table?.rows ?? []), ...modelProtocolRows], knownGroups)
+    const groupsFor = key => key.group === 'auto'
+      ? (Array.isArray(key.autoGroups) && key.autoGroups.length ? key.autoGroups : table?.autoGroups ?? [])
+      : [key.group]
+    const groupSetKnown = key => {
+      const groups = groupsFor(key).filter(group => typeof group === 'string' && group && group !== 'auto')
+      return groups.length > 0 && groups.every(group => protocolGroups.has(group) && protocolGroups.get(group).length > 0)
+    }
+    const identityFor = key => protocolIdentityFor(key)
+    for (const entry of keys) {
+      const key = state.selectedKeys.find(row => row.id === entry.id)
+      if (!key) continue
+      entry.protocolGroups = Object.fromEntries([...protocolGroups].map(([group, values]) => [group, values]))
+      for (const model of entry.models) {
+        const prior = state.confirmed.find(row => row.keyId === key.id && row.modelId === model.modelId)
+        const sameIdentity = prior?.protocolIdentity === identityFor(key)
+        if (!Array.isArray(model.supportedEndpoints) && sameIdentity) model.supportedEndpoints = prior.supportedEndpoints
+        const known = groupSetKnown(key) && isLlmModel(model)
+        const reusable = sameIdentity ? normalizeProtocols(prior.protocols) : []
+        const routingKey = key.group === 'auto' ? { ...key, autoGroups: groupsFor(key) } : key
+        model.protocols = known ? modelProtocols(model, routingKey, protocolGroups) : reusable.length ? reusable : ['openai-completions']
+        model.protocolIdentity = identityFor(key)
+      }
+    }
+    const confirmedProtocolSignature = rows => JSON.stringify(rows.map(row => [row.keyId, row.modelId, normalizeProtocols(row.protocols), row.protocolIdentity]))
+    const previousConfirmed = confirmedProtocolSignature(state.confirmed)
+    const discovered = new Map(keys.flatMap(key => key.models.map(model => [pair(key.id, model.modelId), model])))
+    state.confirmed = state.confirmed.map(row => {
+      const model = discovered.get(pair(row.keyId, row.modelId))
+      if (!model) return row
+      return { ...row, name: model.name, supportedEndpoints: model.supportedEndpoints ?? [], protocols: normalizeProtocols(model.protocols),
+        protocolIdentity: model.protocolIdentity }
+    })
+    state.protocolGroups = Object.fromEntries([...protocolGroups].map(([group, values]) => [group, normalizeProtocols(values)]))
+    const protocolChanged = previousConfirmed !== confirmedProtocolSignature(state.confirmed)
+    if (protocolChanged && state.registration.routes.length) await writeRoutes(entriesFor())
     preview = { keys, groups: normalizeGroups({ usableGroup: table?.usableGroup, groupRatio: table?.groupRatio }), confirmed: state.confirmed, site: state.site, at: new Date().toISOString() }
     cachePrices(preview)
     await syncCosts({ stale: table === null || keys.some(key => !key.modelsLoaded) })
@@ -434,7 +520,12 @@ export function apply(ctx, config = {}) {
       for (const modelId of entry.modelIds) {
         const model = known.get(pair(entry.keyId, modelId))
         if (!model) throw fail('bad_input', 'a selected model is not in this Key preview; refresh the preview')
-        rows.set(pair(entry.keyId, modelId), { keyId: entry.keyId, modelId, name: model.name, ...modelCapabilities(model) })
+        const key = state.selectedKeys.find(item => item.id === entry.keyId)
+        rows.set(pair(entry.keyId, modelId), { keyId: entry.keyId, modelId, name: model.name,
+          supportedEndpoints: Array.isArray(model.supportedEndpoints) ? model.supportedEndpoints : [],
+          protocols: normalizeProtocols(model.protocols).length ? normalizeProtocols(model.protocols) : ['openai-completions'],
+          protocolIdentity: typeof model.protocolIdentity === 'string' ? model.protocolIdentity : protocolIdentityFor(key),
+          ...modelCapabilities(model) })
       }
     }
     state.confirmed = [...rows.values()]
