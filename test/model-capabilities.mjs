@@ -76,7 +76,7 @@ try {
       assert.deepEqual(disk.confirmed[0].input, defaults.input)
       assert.deepEqual(disk.confirmed[0].reasoningEfforts, defaults.reasoningEfforts)
       assert.equal((await host.call('registerModels')).body.data.registered, true)
-      assert.deepEqual(host.meterConfig.customBalances.map(row => row.label), ['Another plugin'])
+      assert.deepEqual(host.meterConfig.customBalances.map(row => row.label), ['Another plugin', 'NikoAPI'], 'the foreign balance survives and only the account query is appended')
       assert.deepEqual(host.meterConfig.priceOverrides, {})
     } finally { await host.close() }
   })

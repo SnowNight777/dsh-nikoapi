@@ -7,7 +7,7 @@ import { requestJson, HttpError, requireUrl, sameOrigin } from '../lib/http.js'
 import { createNikoClient, NikoPermissionError } from '../lib/niko.js'
 import { normalizePricing } from '../lib/pricing.js'
 import { normalizeGroups, groupSecondary } from '../lib/groups.js'
-import { planBinding, planUnbind, BALANCE_LABEL } from '../lib/costmeter.js'
+import { planBinding, planUnbind, planBalanceBinding, BALANCE_LABEL } from '../lib/costmeter.js'
 import { planPriceBinding, planPriceUnbind } from '../lib/costmeter-prices.js'
 import { readState, writeState, mergeState, emptyState } from '../lib/state.js'
 import { buildProviderRoute, findProvidersNamespace, groupProtocolMap, isGptModel, modelCapabilities, modelProtocols, planRoutes, registrationStatus, routeEntries, keyRef, keyRoute } from '../lib/models.js'
@@ -398,6 +398,73 @@ try {
     } finally { await host.close() }
   })
 
+  const confirmedGpt = () => ({ keyId: 11, modelId: 'gpt-test', name: 'gpt-test',
+    supportedEndpoints: ['openai'], protocols: ['openai-completions'], protocolIdentity: '["default",[],false]' })
+  const boundKey = { id: 11, name: 'dev', group: 'default', autoGroups: null, crossGroupRetry: false, status: 'enabled' }
+
+  await test('a fresh cost-meter receives the NikoAPI account balance query once', async () => {
+    const host = await startMockHost(mock.origin, { ...emptyState(), selectedKeys: [boundKey], confirmed: [confirmedGpt()] }, {
+      meterConfig: { billionContextEnabled: false, customBalances: [{ label: 'Other wallet', request: { url: 'https://other.example/balance' } }],
+        priceOverrides: {}, prices: { custom: {}, providers: {} } },
+    })
+    try {
+      await host.call('describe')
+      assert.equal(await host.waitFor(() => host.meterConfig.customBalances.some(row => row.label === BALANCE_LABEL)), true, 'the balance entry was never created')
+      const entry = host.meterConfig.customBalances.find(row => row.label === BALANCE_LABEL)
+      assert.equal(entry.request.url, `${mock.origin}/api/user/self`)
+      assert.equal(entry.request.headers.Authorization, 'Bearer {{NIKOAPI_MANAGEMENT_TOKEN}}')
+      assert.equal(entry.unit, 'CNY')
+      assert.equal(entry.convertToDisplayCurrency, false)
+      assert.deepEqual(entry.extract.remaining, { op: 'divide', path: 'data.quota', by: 500_000 })
+      assert.equal(host.meterConfig.customBalances[0].label, 'Other wallet', 'foreign balances are neither removed nor reordered')
+      await host.flush()
+      assert.equal(host.stats.configUpdates, 1, 'the entry is written once, not on every refresh')
+      const stored = await host.readState()
+      assert.deepEqual(stored.costBinding.balance, { url: `${mock.origin}/api/user/self`, credentialVar: 'NIKOAPI_MANAGEMENT_TOKEN' })
+    } finally { await host.close() }
+  })
+
+  await test('an existing NikoAPI balance entry is reused instead of duplicated', async () => {
+    const legacy = [{ label: BALANCE_LABEL, request: { url: `${mock.origin}/api/usage/token/`, method: 'GET', headers: { Authorization: 'Bearer {{OLD_TOKEN}}' } } }]
+    const host = await startMockHost(mock.origin, { ...emptyState(), selectedKeys: [boundKey], confirmed: [confirmedGpt()] }, { customBalances: legacy })
+    try {
+      await host.call('describe')
+      assert.equal(await host.waitFor(() => host.stats.localStateReads > 0), true, 'cost-meter state was never read')
+      await host.flush()
+      assert.deepEqual(host.meterConfig.customBalances, legacy, 'a user-entry is never rewritten')
+      assert.equal(host.stats.configUpdates, 0)
+      const stored = await host.readState()
+      assert.equal(stored.costBinding.balance, null, 'a reused entry is not claimed as ours')
+    } finally { await host.close() }
+  })
+
+  await test('a user-made account balance template is reused without ownership', async () => {
+    const template = [{ label: BALANCE_LABEL, enabled: true, display: 'both', refreshMinutes: 30, unit: 'CNY', convertToDisplayCurrency: false,
+      request: { url: `${mock.origin}/api/user/self`, method: 'GET', headers: { Authorization: 'Bearer {{MY_TOKEN}}' } },
+      extract: { remaining: { op: 'divide', path: 'data.quota', by: 500_000 }, maxBudget: 200, spend: 'info.spend' } }]
+    const host = await startMockHost(mock.origin, { ...emptyState(), selectedKeys: [boundKey], confirmed: [confirmedGpt()] }, { customBalances: template })
+    try {
+      await host.call('describe')
+      assert.equal(await host.waitFor(() => host.stats.localStateReads > 0), true)
+      await host.flush()
+      assert.deepEqual(host.meterConfig.customBalances, template, 'the working template keeps its own interval and credential')
+      assert.equal(host.stats.configUpdates, 0)
+    } finally { await host.close() }
+  })
+
+  await test('balance planning never touches prices', async () => {
+    const plan = planBalanceBinding({ customBalances: [], priceOverrides: {}, prices: { custom: {} } }, { origin: mock.origin, refreshMinutes: 15 })
+    assert.equal(plan.ok, true)
+    assert.deepEqual(Object.keys(plan.patch), ['customBalances'])
+    assert.equal(plan.created, true)
+    assert.equal(plan.patch.customBalances[0].label, BALANCE_LABEL)
+    const reused = planBalanceBinding({ customBalances: plan.patch.customBalances }, { origin: mock.origin, ownedBalance: plan.balance })
+    assert.equal(reused.changed, false, 'our own entry is reused when the origin is unchanged')
+    const full = planBalanceBinding({ customBalances: Array.from({ length: 8 }, (_, i) => ({ label: `L${i}` })) }, { origin: mock.origin })
+    assert.equal(full.ok, false)
+    assert.equal(planBalanceBinding({ customBalances: [] }, { origin: 'not a url' }).ok, false)
+  })
+
   await test('billion-context assistance is switched off once cost-meter is detected', async () => {
     const selectedKey = { id: 11, name: 'dev', group: 'default', autoGroups: null, crossGroupRetry: false, status: 'enabled' }
     const host = await startMockHost(mock.origin, { ...emptyState(), selectedKeys: [selectedKey], confirmed: [{ keyId: 11, modelId: 'gpt-test', name: 'gpt-test',
@@ -407,10 +474,11 @@ try {
     try {
       await host.call('describe')
       assert.equal(await host.waitFor(() => host.stats.configUpdates > 0), true, 'cost-meter config was never updated')
-      assert.deepEqual(host.stats.configPatches, [{ billionContextEnabled: false }])
+      assert.deepEqual(host.stats.configPatches[0], { billionContextEnabled: false })
       assert.equal(host.meterConfig.billionContextEnabled, false)
       await host.flush()
-      assert.equal(host.stats.configUpdates, 1, 'the switch is written once per activation, not on every refresh')
+      assert.equal(host.stats.configUpdates, 2, 'the switch and the balance entry are each written once per activation')
+      assert.deepEqual(host.stats.configPatches.map(patch => Object.keys(patch)), [['billionContextEnabled'], ['customBalances']])
     } finally { await host.close() }
   })
 
@@ -423,8 +491,10 @@ try {
     try {
       await host.call('describe')
       assert.equal(await host.waitFor(() => host.stats.localStateReads > 0), true, 'cost-meter state was never read')
-      assert.equal(host.stats.configUpdates, 0)
+      await host.flush()
       assert.equal(host.meterConfig.billionContextEnabled, false)
+      assert.equal(host.stats.configPatches.some(patch => Object.hasOwn(patch, 'billionContextEnabled')), false, 'an already disabled switch is never rewritten')
+      assert.equal(host.stats.configUpdates, 1, 'only the balance entry is written once')
     } finally { await host.close() }
   })
 
@@ -446,7 +516,7 @@ try {
       assert.equal(status.body.data.cost.enabled, true)
       assert.equal(status.body.data.cost.automatic, true)
       assert.equal(status.body.data.cost.registeredCount, 0, 'missing legacy credentials cannot create a calculator')
-      assert.deepEqual(host.meterConfig.customBalances.map(entry => entry.label), ['Another plugin'])
+      assert.deepEqual(host.meterConfig.customBalances.map(entry => entry.label), ['Another plugin', BALANCE_LABEL], 'the foreign entry is kept and only the missing account query is added')
     } finally { await host.close() }
   })
 

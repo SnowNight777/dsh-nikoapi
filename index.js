@@ -5,6 +5,7 @@ import { normalizeGroups } from './lib/groups.js'
 import { calculatePrice, hasManualPrice, usablePrice } from './lib/price-calculator.js'
 import { API_KEY_ENV, findProvidersNamespace, isLlmModel, keyRef, keyRoute, groupProtocolMap, modelCapabilities, modelProtocols, normalizeProtocols, planRoutes, registrationStatus, routeEntries } from './lib/models.js'
 import { readState, writeState, emptyState, keyMetadata, directoryKeyMetadata, keyPriceIdentity } from './lib/state.js'
+import { planBalanceBinding } from './lib/costmeter.js'
 import { HttpError } from './lib/http.js'
 
 export const name = 'nikoapi'
@@ -291,6 +292,20 @@ export function apply(ctx, config = {}) {
         meterConfig = { ...meterConfig, billionContextEnabled: false }
         ctx.logger?.info?.('nikoapi: billion-context assistance disabled for cost-meter billing')
       } catch { /* the switch is advisory; price calculators keep working without it */ }
+    }
+    if (typeof service.updateConfig === 'function') {
+      const planned = planBalanceBinding(meterConfig, { origin, refreshMinutes: state.costBinding.refreshMinutes, ownedBalance: state.costBinding.balance })
+      if (planned.changed && planned.patch) {
+        try {
+          await service.updateConfig(planned.patch)
+          meterConfig = { ...meterConfig, ...planned.patch }
+          state.costBinding = { ...state.costBinding, balance: planned.balance }
+          ctx.logger?.info?.(planned.created
+            ? 'nikoapi: linked the NikoAPI account balance query in cost-meter'
+            : 'nikoapi: moved the owned account balance query to the current site')
+        } catch { /* balance linking is optional; prices keep working without it */ }
+        if (disposed || meter !== service || meterEpoch !== epoch) return costDescription()
+      }
     }
     const routes = new Set(registration.routes)
     const cached = new Map(state.priceSnapshots.map(row => [pair(row.keyId, row.modelId), row]))
