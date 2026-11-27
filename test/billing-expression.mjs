@@ -23,11 +23,22 @@ for (const [input, cached, tier, expected] of [[271999,0,'short',0.679998], [272
 const fixed = nikoBillingBreakdown({}, entry('tier("request", fixed(0.12))'), 0)
 assert.equal(fixed.cost, 0.06); assert.equal(fixed.rows[0].requests, 1); checks++
 assert.equal(nikoBillingBreakdown({}, entry('tier("free", fixed(0))'), 0).cost, 0); checks++
+// Claude 1h cache writes: DSH reports only the merged total, so the short-TTL bucket
+// carries all of it (new-api's unlabelled-remainder default), never a zero charge.
 const ttl = analyzeNikoBillingExpression('tier("x", p * 2 + cc1h * 20)')
-assert.equal(ttl.supported, true); assert.equal(ttl.zeroOnCacheWrite, true)
+assert.equal(ttl.supported, true)
 near(nikoBillingBreakdown({ input: 100, output: 2, cacheWrite: 0 }, entry('tier("x", p * 2 + cc1h * 20)'), 0).cost, 0.0001)
-const ttlZero = nikoBillingBreakdown({ input: 100, output: 2, cacheWrite: 1 }, entry('tier("x", p * 2 + cc1h * 20)'), 0)
-assert.equal(ttlZero.cost, 0); assert.deepEqual(ttlZero.rows, [{ bucket: 'modelRequests', tokens: 0, requests: 1, rate: 0, cost: 0, priced: true }])
+const ttlFallback = nikoBillingBreakdown({ input: 100, output: 2, cacheWrite: 1 }, entry('tier("x", p * 2 + cc1h * 20)'), 0)
+near(ttlFallback.cost, 0.000102)
+assert.deepEqual(ttlFallback.rows.map(row => row.bucket), ['input', 'cacheWrite', 'output'])
+// The deployed Claude expression bills cache writes at the 5m rate instead of zeroing them.
+const claude = nikoBillingBreakdown({ input: 2, output: 160, cacheWrite: 74_181 }, {
+  billingExpr: 'tier("standard", p * 4 + cr * 0.2 + cc * 5 + cc1h * 8 + c * 20)',
+  billingQuotaPerUnit: 500_000, billingGroupRatio: 0.85 }, 0)
+near(claude.cost, 0.317996)
+const claudeCacheWrite = claude.rows.find(row => row.bucket === 'cacheWrite')
+assert.ok(claudeCacheWrite && Math.abs(claudeCacheWrite.rate - 4.25) < 1e-12)
+near(claude.rows.reduce((n, r) => n + r.cost, 0), claude.cost)
 const special = nikoBillingBreakdown({ input: 100, output: 2 }, entry('tier("video", u("seconds") * 0.1)'), 0)
 assert.equal(special.cost, 0); assert.equal(special.rows[0].bucket, 'modelRequests'); assert.equal(special.rows[0].priced, true); checks++
 const image = nikoBillingBreakdown({ input: 100, output: 2 }, entry('tier("image", fixed(0.12)) * image_count'), 0)

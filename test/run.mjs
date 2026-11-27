@@ -11,7 +11,7 @@ import { planBinding, planUnbind, BALANCE_LABEL } from '../lib/costmeter.js'
 import { planPriceBinding, planPriceUnbind } from '../lib/costmeter-prices.js'
 import { readState, writeState, mergeState, emptyState } from '../lib/state.js'
 import { buildProviderRoute, findProvidersNamespace, groupProtocolMap, isGptModel, modelCapabilities, modelProtocols, planRoutes, registrationStatus, routeEntries, keyRef, keyRoute } from '../lib/models.js'
-import { isTrustedRequest } from '../index.js'
+import { isTrustedRequest, failureDiagnosticFields, formatFailureDiagnostic } from '../index.js'
 import { startMockHost } from './mock-host.mjs'
 
 let passed = 0
@@ -23,6 +23,29 @@ async function test(name, fn) {
 const mock = await startMockNiko()
 try {
   const client = createNikoClient({ baseUrl: mock.origin })
+  await test('failure diagnostics expose only safe operation and error metadata', async () => {
+    const error = Object.assign(new TypeError('management-token-secret'), { code: 'EACCES' })
+    const fields = failureDiagnosticFields('selectKeys', error, 'operation_failed')
+    assert.deepEqual(fields, { operation: 'selectKeys', failureCode: 'operation_failed', errorName: 'TypeError', causeCode: 'EACCES', errorCode: 'EACCES' })
+    const line = formatFailureDiagnostic('selectKeys', error, 'operation_failed')
+    assert.equal(line, 'nikoapi: operation_failed method=selectKeys error=TypeError cause=EACCES')
+    assert.equal(JSON.stringify(fields).includes('management-token-secret'), false)
+    const secretCode = Object.assign(new Error('private'), { code: 'sk123456789012345678901234567890123456' })
+    assert.deepEqual(failureDiagnosticFields('token=secret', secretCode, 'x'.repeat(36)),
+      { operation: 'unknown', failureCode: 'operation_failed', errorName: 'Error', causeCode: 'none', errorCode: 'operation_failed' })
+  })
+  await test('host API returns only safe failure metadata for client diagnostics', async () => {
+    const host = await startMockHost(mock.origin)
+    try {
+      const result = await host.call('connect', { managementToken: '' })
+      assert.equal(result.body.ok, false)
+      assert.deepEqual(result.body.error.diagnostic, { method: 'connect', errorType: 'Error', errorCode: 'bad_input' })
+      assert.equal(JSON.stringify(result.body.error.diagnostic).includes('management token is empty'), false)
+      const selection = await host.call('selectKeys', { keys: [{ id: 11 }] })
+      assert.deepEqual(selection.body.error.diagnostic,
+        { method: 'selectKeys', errorType: 'Error', errorCode: 'pat_missing' })
+    } finally { await host.close() }
+  })
   await test('exact origin fence includes scheme, host and port', async () => {
     assert.equal(sameOrigin(new URL(mock.origin), new URL(mock.origin)), true)
     assert.equal(sameOrigin(new URL(mock.trapOrigin), new URL(mock.origin)), false)
@@ -108,6 +131,32 @@ try {
     assert.equal(routeA.baseURL, `${mock.origin}/v1`)
     assert.equal(response.api, 'openai-responses')
     assert.equal(keyRoute(11), 'nikoapi-11')
+  })
+  await test('Anthropic route defaults disable reasoning with false and preserve explicit capabilities', () => {
+    const legacy = mergeState({ version: 4, selectedKeys: [{ id: 11 }], confirmed: [{
+      keyId: 11, modelId: 'claude-test', protocols: ['anthropic-messages'],
+      protocolIdentity: '["default",[],false]', ...modelCapabilities(),
+    }] })
+    const row = legacy.confirmed[0]
+    const entries = [{ keyId: 11, modelIds: [row.modelId], models: [{ ...row, id: row.modelId }] }]
+    const route = planRoutes([], entries, mock.origin).routes['nikoapi-11']
+    assert.equal(route.api, 'anthropic-messages')
+    assert.equal(route.baseURL, mock.origin, 'Anthropic SDK appends /v1 itself')
+    assert.equal(route.models[0].reasoningEfforts, false, 'off-only maps are invalid in DSH; use false')
+    assert.equal(row.reasoningEffortsDeclared, false, 'legacy normalized defaults are not server declarations')
+    const explicit = buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(11),
+      modelIds: ['claude-test'], protocol: 'anthropic-messages', models: [{
+        id: 'claude-test', reasoningEffortsDeclared: true, reasoningEfforts: { off: null, high: 'vendor-high' },
+      }] })
+    assert.deepEqual(explicit.models[0].reasoningEfforts, { off: null, high: 'vendor-high' })
+    explicit.models[0].reasoningEfforts = { off: null, low: 'user-low' }
+    assert.equal(registrationStatus({ providers: { 'nikoapi-11': explicit } }, entries, mock.origin).registered, true,
+      'user-adjusted capabilities do not trigger route rewrites')
+    const disabled = buildProviderRoute({ origin: mock.origin, apiKeyEnv: keyRef(11),
+      modelIds: ['claude-test'], protocol: 'anthropic-messages', models: [{
+        id: 'claude-test', reasoningEffortsDeclared: true, reasoningEfforts: false,
+      }] })
+    assert.equal(disabled.models[0].reasoningEfforts, false)
   })
   await test('group protocol sets are shared across models and auto groups use their intersection', () => {
     const rows = [
@@ -346,6 +395,36 @@ try {
       assert.equal(host.providers['nikoapi-99-anthropic'].api, 'anthropic-messages', 'a prefix lookalike not in ownership state is preserved')
       const stored = await host.readState()
       assert.deepEqual(stored.registration.routes, ['nikoapi-11'], 'only the one current route remains owned')
+    } finally { await host.close() }
+  })
+
+  await test('billion-context assistance is switched off once cost-meter is detected', async () => {
+    const selectedKey = { id: 11, name: 'dev', group: 'default', autoGroups: null, crossGroupRetry: false, status: 'enabled' }
+    const host = await startMockHost(mock.origin, { ...emptyState(), selectedKeys: [selectedKey], confirmed: [{ keyId: 11, modelId: 'gpt-test', name: 'gpt-test',
+      supportedEndpoints: ['openai'], protocols: ['openai-completions'], protocolIdentity: '["default",[],false]' }] }, {
+      meterConfig: { billionContextEnabled: true, customBalances: [], priceOverrides: {}, prices: { custom: {}, providers: {} } },
+    })
+    try {
+      await host.call('describe')
+      assert.equal(await host.waitFor(() => host.stats.configUpdates > 0), true, 'cost-meter config was never updated')
+      assert.deepEqual(host.stats.configPatches, [{ billionContextEnabled: false }])
+      assert.equal(host.meterConfig.billionContextEnabled, false)
+      await host.flush()
+      assert.equal(host.stats.configUpdates, 1, 'the switch is written once per activation, not on every refresh')
+    } finally { await host.close() }
+  })
+
+  await test('billion-context already disabled is left untouched', async () => {
+    const selectedKey = { id: 11, name: 'dev', group: 'default', autoGroups: null, crossGroupRetry: false, status: 'enabled' }
+    const host = await startMockHost(mock.origin, { ...emptyState(), selectedKeys: [selectedKey], confirmed: [{ keyId: 11, modelId: 'gpt-test', name: 'gpt-test',
+      supportedEndpoints: ['openai'], protocols: ['openai-completions'], protocolIdentity: '["default",[],false]' }] }, {
+      meterConfig: { billionContextEnabled: false, customBalances: [], priceOverrides: {}, prices: { custom: {}, providers: {} } },
+    })
+    try {
+      await host.call('describe')
+      assert.equal(await host.waitFor(() => host.stats.localStateReads > 0), true, 'cost-meter state was never read')
+      assert.equal(host.stats.configUpdates, 0)
+      assert.equal(host.meterConfig.billionContextEnabled, false)
     } finally { await host.close() }
   })
 

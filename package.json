@@ -1,9 +1,28 @@
 {
   "name": "dsh-nikoapi",
   "version": "0.1.0",
-  "private": true,
+  "description": "Connect NikoAPI (New API relay) keys and grouped models to DeepSeek Harness, with automatic cost-meter price linking.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "nikoapi",
+    "new-api"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "SnowNight777",
+    "email": "318125535+SnowNight777@users.noreply.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SnowNight777/dsh-nikoapi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SnowNight777/dsh-nikoapi/issues"
+  },
+  "homepage": "https://github.com/SnowNight777/dsh-nikoapi#readme",
   "type": "module",
-  "description": "Connect NikoAPI (New API relay) keys and grouped models to DeepSeekRuntime.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -16,11 +35,17 @@
     "lib",
     "cordis.patch.yml",
     "locale/*.json",
-    "docs",
+    "images",
     "icon.svg"
   ],
   "scripts": {
     "test": "node test/run.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dsh": {
     "bundle": {

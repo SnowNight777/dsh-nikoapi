@@ -33,7 +33,8 @@ window.__ModuleLoader__.load({
       registered: '已接入 {count} 个模型项', registrationFailed: '模型接入失败：{message}', saved: '已保存',
       unregistered: '尚未接入模型', registerAgain: '重新接入已保存模型', removeRegistration: '移除已接入模型',
       selected: '已选择', enabled: '已启用', disabled: '已禁用', expired: '已过期', exhausted: '已耗尽', unknown: '未知',
-      failed: '操作失败：{message}', unavailable: 'NikoAPI 服务暂不可用，请刷新或重启 DSH 后重试。',
+      failed: '操作失败：{message}', failureDiagnostic: '诊断：{method} · {type} · {code}',
+      unavailable: 'NikoAPI 服务暂不可用，请刷新或重启 DSH 后重试。',
       costPlugin: '费用插件', costReady: '已安装 · 服务可用', costMissing: '未启用或服务不可用',
       costMissingHint: 'dsh-cost-meter 尚不可用，无法建立联动。', costUnsupported: '费用插件缺少所需接口。',
       interval: '费率刷新间隔（分钟）', intervalHint: '自动刷新已确认模型的费率；Key 列表由刷新按钮更新。',
@@ -69,7 +70,8 @@ window.__ModuleLoader__.load({
       registered: '{count} model entries connected', registrationFailed: 'Model connection failed: {message}', saved: 'Saved',
       unregistered: 'No models connected yet', registerAgain: 'Reconnect saved models', removeRegistration: 'Remove connected models',
       selected: 'Selected', enabled: 'Enabled', disabled: 'Disabled', expired: 'Expired', exhausted: 'Exhausted', unknown: 'Unknown',
-      failed: 'Failed: {message}', unavailable: 'NikoAPI is unavailable. Refresh or restart DSH and try again.',
+      failed: 'Failed: {message}', failureDiagnostic: 'Diagnostic: {method} · {type} · {code}',
+      unavailable: 'NikoAPI is unavailable. Refresh or restart DSH and try again.',
       costPlugin: 'Cost plugin', costReady: 'Installed · service available', costMissing: 'Not enabled or service unavailable',
       costMissingHint: 'dsh-cost-meter is unavailable; a link cannot be established.', costUnsupported: 'The cost plugin lacks the required API.',
       interval: 'Rate refresh interval (minutes)', intervalHint: 'Refreshes rates for confirmed models automatically. Use Refresh to update the Key directory.',
@@ -109,6 +111,12 @@ window.__ModuleLoader__.load({
       if (result?.ok === true) return result.data
       const error = new Error(result?.error?.message ?? t('unavailable'))
       error.code = result?.error?.code
+      const diagnostic = result?.error?.diagnostic
+      if (typeof diagnostic?.method === 'string' && /^[a-z][A-Za-z0-9]{0,39}$/.test(diagnostic.method)
+        && typeof diagnostic.errorType === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,39}$/.test(diagnostic.errorType)
+        && typeof diagnostic.errorCode === 'string' && /^[A-Za-z0-9_.-]{1,40}$/.test(diagnostic.errorCode)) {
+        error.diagnostic = { method: diagnostic.method, type: diagnostic.errorType, code: diagnostic.errorCode }
+      }
       throw error
     }
     const badge = text => h('span', { className: 'nk-badge' }, text)
@@ -201,7 +209,14 @@ window.__ModuleLoader__.load({
         if (pending.current) return undefined
         pending.current = true; setBusy(true); setError(''); setNotice('')
         try { return await work() }
-        catch (failure) { if (mounted.current && failure?.name !== 'AbortError') setError(t('failed', { message: failure.message })); return undefined }
+        catch (failure) {
+          if (mounted.current && failure?.name !== 'AbortError') {
+            const message = t('failed', { message: failure.message })
+            const details = failure.diagnostic ? t('failureDiagnostic', failure.diagnostic) : ''
+            setError(details ? `${message}（${details}）` : message)
+          }
+          return undefined
+        }
         finally { pending.current = false; if (mounted.current) setBusy(false) }
       }, [])
       const reload = React.useCallback(async () => { const next = await call('describe'); if (mounted.current) setInfo(next); return next }, [])

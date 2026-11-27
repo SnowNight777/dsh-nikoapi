@@ -2,6 +2,6 @@
   "meta": {
     "title": "NikoAPI",
     "description": "Connect a NikoAPI (New API relay) account, add models by Key group, and automatically register confirmed model price calculators when a compatible dsh-cost-meter is available. Credentials remain in DSH's local credential store and are not shown again.",
-    "detail": "docs/DETAIL.md"
+    "detail": "README.en.md"
   }
 }

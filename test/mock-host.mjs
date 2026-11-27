@@ -21,11 +21,18 @@ export async function startMockHost(baseUrl, initialState, options = {}) {
   })
   const ledger = { config: meterConfig, days: {} }
   const calculators = new Map()
-  const stats = { localStateReads: 0, registrations: 0, disposals: 0 }
+  const stats = { localStateReads: 0, registrations: 0, disposals: 0, configUpdates: 0, configPatches: [] }
   const costMeter = {
     async getLocalState() {
       stats.localStateReads++
       await options.beforeLocalState?.()
+      return { config: structuredClone(meterConfig) }
+    },
+    async updateConfig(patch) {
+      stats.configUpdates++
+      stats.configPatches.push(structuredClone(patch))
+      meterConfig = { ...meterConfig, ...structuredClone(patch) }
+      ledger.config = meterConfig
       return { config: structuredClone(meterConfig) }
     },
     registerPriceCalculator({ provider, model, calculate }) {

@@ -20,6 +20,34 @@ const safeFailure = error => {
   if (typeof error?.code === 'string' && /^[a-z_]+$/.test(error.code)) return error
   return fail('operation_failed', 'operation failed; existing credentials and unrelated settings were not exposed')
 }
+const SAFE_FAILURE_CODES = new Set([
+  'bad_input', 'credential_invalid', 'disposed', 'key_missing', 'llm_unavailable', 'models_none',
+  'model_preview_failed', 'no_credentials', 'operation_failed', 'pat_missing', 'registration_unverified',
+  'route_conflict', 'scope_missing', 'state_unavailable', 'unknown_method', 'upstream',
+  'invalid_expression', 'unsupported_expression', 'unsupported_context', 'invalid_result', 'invalid_usage',
+])
+const SAFE_NATIVE_CODES = new Set([
+  'EACCES', 'EBUSY', 'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'EEXIST', 'EHOSTUNREACH',
+  'EINTR', 'EINVAL', 'EIO', 'EISDIR', 'EMFILE', 'ENETUNREACH', 'ENFILE', 'ENOENT', 'ENOTDIR',
+  'ENOMEM', 'EPIPE', 'ETIMEDOUT', 'ENOTFOUND', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_URL',
+  'BAD_URL', 'BAD_SCHEME', 'CROSS_ORIGIN', 'NO_FETCH', 'REDIRECT', 'BAD_JSON', 'TIMEOUT',
+  'NETWORK', 'TOO_LARGE', 'UNAUTHORIZED', 'UPSTREAM', 'INCOMPLETE',
+])
+const SAFE_ERROR_NAMES = new Set([
+  'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'URIError', 'EvalError',
+  'AggregateError', 'AbortError', 'TimeoutError', 'HttpError', 'NikoPermissionError',
+])
+export function failureDiagnosticFields(method, error, code) {
+  const operation = typeof method === 'string' && /^[a-z][A-Za-z0-9]{0,39}$/.test(method) ? method : 'unknown'
+  const failureCode = SAFE_FAILURE_CODES.has(code) ? code : 'operation_failed'
+  const errorName = SAFE_ERROR_NAMES.has(error?.name) ? error.name : 'Error'
+  const causeCode = SAFE_FAILURE_CODES.has(error?.code) || SAFE_NATIVE_CODES.has(error?.code) ? error.code : 'none'
+  return { operation, failureCode, errorName, causeCode, errorCode: causeCode === 'none' ? failureCode : causeCode }
+}
+export function formatFailureDiagnostic(method, error, code) {
+  const fields = failureDiagnosticFields(method, error, code)
+  return `nikoapi: ${fields.failureCode} method=${fields.operation} error=${fields.errorName} cause=${fields.causeCode}`
+}
 
 export function apply(ctx, config = {}) {
   const origin = new URL(config.baseUrl || DEFAULT_BASE_URL).origin
@@ -30,6 +58,7 @@ export function apply(ctx, config = {}) {
   let meter = null
   let meterEpoch = 0
   let meterConfig = null
+  let billionContextEpoch = -1
   let queue = Promise.resolve()
   let syncScheduled = false
   let syncRequested = false
@@ -80,7 +109,9 @@ export function apply(ctx, config = {}) {
       const rows = confirmed.filter(row => row.keyId === key.id)
       return { keyId: key.id, name: `${key.name} · ${key.group || 'inherited'} · #${key.id}`,
         modelIds: rows.map(row => row.modelId), models: rows.map(row => ({ id: row.modelId, supportedEndpoints: row.supportedEndpoints,
-          protocols: row.protocolIdentity === protocolIdentityFor(key) ? row.protocols : ['openai-completions'], ...modelCapabilities(row) })) }
+          protocols: row.protocolIdentity === protocolIdentityFor(key) ? row.protocols : ['openai-completions'],
+          reasoningEffortsDeclared: row.reasoningEffortsDeclared === true,
+          ...modelCapabilities(row) })) }
     }).filter(row => row.modelIds.length)
   }
   function entriesFor(keys = state.selectedKeys, confirmed = state.confirmed) {
@@ -253,6 +284,14 @@ export function apply(ctx, config = {}) {
       return costDescription()
     }
     meterConfig = current.config
+    if (typeof service.updateConfig === 'function' && meterConfig.billionContextEnabled === true && billionContextEpoch !== epoch) {
+      billionContextEpoch = epoch
+      try {
+        await service.updateConfig({ billionContextEnabled: false })
+        meterConfig = { ...meterConfig, billionContextEnabled: false }
+        ctx.logger?.info?.('nikoapi: billion-context assistance disabled for cost-meter billing')
+      } catch { /* the switch is advisory; price calculators keep working without it */ }
+    }
     const routes = new Set(registration.routes)
     const cached = new Map(state.priceSnapshots.map(row => [pair(row.keyId, row.modelId), row]))
     const desired = new Set(), conflicts = [], unavailable = []
@@ -269,8 +308,7 @@ export function apply(ctx, config = {}) {
         try {
           const dispose = service.registerPriceCalculator({ provider: entry.providerId, model: model.id, calculate({ usage, atMs }) {
             if (!slot.active || disposed || meter !== service || meterEpoch !== epoch || !validSnapshot(slot.rate)
-              || !describeRegistration().routes.includes(entry.providerId)
-              || hasManualPrice(meterConfig, entry.providerId, model.id, state.costBinding)) return null
+              || !describeRegistration().routes.includes(entry.providerId)) return null
             return calculatePrice(slot.rate.price, usage, atMs)
           } })
           if (typeof dispose !== 'function') throw new Error('calculator registration did not return a disposer')
@@ -346,7 +384,8 @@ export function apply(ctx, config = {}) {
       await syncCosts()
       return { ...(await describe()), failed: [] }
     }
-    const pat = await requirePat(), result = await niko().allKeys(pat)
+    const pat = await requirePat()
+    const result = await niko().allKeys(pat)
     const known = new Map(result.items.map(key => [key.id, key]))
     const invalid = ids.find(id => !known.has(id) || known.get(id).status !== 'enabled')
     if (invalid !== undefined) throw fail('bad_input', `Key #${invalid} is absent or not enabled; refresh the Key list`)
@@ -373,7 +412,9 @@ export function apply(ctx, config = {}) {
     bump(); prunePrices()
     if (state.registration.routes.length || state.confirmed.length) await writeRoutes(entriesFor())
     await save()
-    for (const key of previous) if (!selected.some(next => next.id === key.id)) await store.unset(keyRef(key.id))
+    for (const key of previous) if (!selected.some(next => next.id === key.id)) {
+      await store.unset(keyRef(key.id))
+    }
     await syncCosts()
     return { ...(await describe()), failed }
   }
@@ -382,10 +423,6 @@ export function apply(ctx, config = {}) {
     const pat = await requirePat()
     const source = (await niko().allKeys(pat)).items.find(key => key.id === keyId)
     if (!source) throw fail('bad_input', 'Key is no longer available')
-    // Changing pricing identity invalidates only this Key's rates; its explicit model choices remain.
-    state.priceSnapshots = state.priceSnapshots.filter(row => row.keyId !== keyId)
-    prunePrices()
-    await save()
     const nextGroup = group.trim()
     try {
       await niko().updateGroup(pat, keyId, { group: nextGroup,
@@ -393,6 +430,9 @@ export function apply(ctx, config = {}) {
         crossGroupRetry: typeof crossGroupRetry === 'boolean' ? crossGroupRetry : source.crossGroupRetry })
       const updated = (await niko().allKeys(pat)).items.find(key => key.id === keyId)
       if (!updated || updated.group !== nextGroup) throw fail('upstream', 'updated Key metadata was not confirmed; refresh the list')
+      // Changing pricing identity invalidates only this Key's rates; its explicit model choices remain.
+      state.priceSnapshots = state.priceSnapshots.filter(row => row.keyId !== keyId)
+      prunePrices()
       state.selectedKeys = state.selectedKeys.map(key => key.id === keyId ? keyMetadata(updated) : key)
       state.keyDirectory.keys = state.keyDirectory.keys.map(key => key.id === keyId ? directoryKeyMetadata(updated) : key)
       if (state.registration.routes.length) await writeRoutes(entriesFor())
@@ -437,6 +477,11 @@ export function apply(ctx, config = {}) {
           const supportedEndpoints = model.supportedEndpoints ?? (pricingEndpoints.length ? pricingEndpoints : null)
           return { modelId: model.id, name: model.name, supportedEndpoints,
             ...modelCapabilities({ input: model.inputModalities, reasoningEfforts: model.reasoningEfforts }),
+            // Preserve whether the upstream API explicitly declared a reasoning-efforts policy.
+            // null means "not declared"; false means "declared as unsupported". Both differ from
+            // an object with levels. buildProviderRoute uses this to default anthropic-messages
+            // routes to false only when the server never declared a policy.
+            reasoningEffortsDeclared: model.reasoningEfforts !== null && model.reasoningEfforts !== undefined,
             price: prices.get(model.id) ?? { kind: 'unknown', currency, note: table === null ? 'price table unavailable for this Key' : 'no exact applicable price' },
             confirmed: Boolean(prior) }
         }).filter(isLlmModel)
@@ -525,6 +570,7 @@ export function apply(ctx, config = {}) {
           supportedEndpoints: Array.isArray(model.supportedEndpoints) ? model.supportedEndpoints : [],
           protocols: normalizeProtocols(model.protocols).length ? normalizeProtocols(model.protocols) : ['openai-completions'],
           protocolIdentity: typeof model.protocolIdentity === 'string' ? model.protocolIdentity : protocolIdentityFor(key),
+          reasoningEffortsDeclared: model.reasoningEffortsDeclared === true,
           ...modelCapabilities(model) })
       }
     }
@@ -619,8 +665,13 @@ export function apply(ctx, config = {}) {
       try { sendJson(res, 200, { ok: true, data: await dispatch(payload?.method, payload?.params) }) }
       catch (error) {
         const failure = safeFailure(error)
-        ctx.logger?.warn?.(`nikoapi: ${failure.code}`)
-        sendJson(res, ['unknown_method', 'bad_input'].includes(failure.code) ? 400 : 200, { ok: false, error: { code: failure.code, message: failure.message, scope: failure.scope } })
+        const operation = typeof payload?.method === 'string' && Object.hasOwn(operations, payload.method) ? payload.method : 'unknown'
+        const diagnostic = failureDiagnosticFields(operation, error, failure.code)
+        ctx.logger?.warn?.(formatFailureDiagnostic(operation, error, failure.code))
+        sendJson(res, ['unknown_method', 'bad_input'].includes(failure.code) ? 400 : 200, { ok: false, error: {
+          code: failure.code, message: failure.message, scope: failure.scope,
+          diagnostic: { method: diagnostic.operation, errorType: diagnostic.errorName, errorCode: diagnostic.errorCode },
+        } })
       }
     } }), 'nikoapi: web api')
   })
